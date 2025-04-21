@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>4월 BEPRO Analysis List</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* 스타일은 이전과 동일 */
+        body { font-family: 'Inter', sans-serif; }
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #e2e8f0; vertical-align: top; word-break: keep-all; }
+        th { background-color: #f8fafc; font-weight: 600; }
+        tr:hover { background-color: #f1f5f9; }
+        .loader { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite; margin-right: 8px; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .hidden { display: none; }
+        .sheet-title { font-size: 1.125rem; font-weight: 600; margin-top: 1.5rem; margin-bottom: 0.5rem; padding-bottom: 0.5rem; border-bottom: 2px solid #e2e8f0; }
+    </style>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+</head>
+<body class="bg-gray-100 p-8">
+    <div class="container mx-auto max-w-5xl bg-white p-6 rounded-lg shadow-md">
+        <h1 class="text-2xl font-semibold mb-6 text-center text-gray-700">4월 BEPRO Analysis List</h1>
+
+        <div class="mb-6 flex flex-col sm:flex-row items-center justify-center gap-4">
+            <input type="text" id="analystNameInput" placeholder="분석관 이름을 입력하세요" class="flex-grow p-3 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <button id="searchButton" class="w-full sm:w-auto bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 rounded-md transition duration-200 ease-in-out flex items-center justify-center">
+                <span id="buttonText">검색</span>
+                <div id="loadingSpinner" class="loader hidden"></div>
+                <span id="loadingText" class="hidden">데이터 로딩 중...</span>
+            </button>
+        </div>
+
+        <div id="resultsArea" class="mt-8">
+             <div id="errorMessage" class="text-red-500 text-center mb-4 hidden"></div>
+            <div id="totalFeeDisplay" class="mb-6 text-xl font-semibold text-gray-800 hidden"></div>
+             <div id="resultsContainer"></div>
+             <div id="noResultsMessageGlobal" class="text-center text-gray-500 mt-6 hidden">
+                해당 분석관의 경기 정보를 찾을 수 없습니다.
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- Main Application Logic --- (Fetch Individual Sheets by GID - Updated)
+
+        // DOM 요소 가져오기
+        const analystNameInput = document.getElementById('analystNameInput');
+        const searchButton = document.getElementById('searchButton');
+        const resultsArea = document.getElementById('resultsArea');
+        const totalFeeDisplay = document.getElementById('totalFeeDisplay');
+        const resultsContainer = document.getElementById('resultsContainer');
+        const noResultsMessageGlobal = document.getElementById('noResultsMessageGlobal');
+        const loadingSpinner = document.getElementById('loadingSpinner');
+        const loadingText = document.getElementById('loadingText');
+        const buttonText = document.getElementById('buttonText');
+        const errorMessage = document.getElementById('errorMessage');
+
+        // --- 시트 설정 ---
+        const BASE_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vT6DZJrOXSugr3pLbp2KcKN1wPxvhpIL8D05Va0-FHJzbCPk5dkaSjN0JCmqBCRf4MESUG8MXVZEm1J/pub';
+        const SHEET_CONFIG = {
+            "축구": "1872681643",
+            "라이브": "1307858164",
+            "풋살": "653804127",
+            "핸드볼": "687362438",
+            "농구": "952457769"
+        };
+        const TARGET_SHEETS_ORDER = ["축구", "라이브", "풋살", "핸드볼", "농구"]; // 표시 순서
+
+        // 전역 변수: 시트별 데이터 및 헤더 저장
+        let sheetData = {}; // { sheetName: [ [fields], ... ] }
+        let sheetHeaders = {}; // { sheetName: [header_fields] }
+
+        // 한 줄을 파싱하는 내부 함수
+        const parseCsvLine = (line) => {
+            const fields = [];
+            let currentField = '';
+            let inQuotes = false;
+            for (let i = 0; i < line.length; i++) {
+                const char = line[i];
+                const nextChar = line[i + 1];
+                if (char === '"') {
+                    if (inQuotes && nextChar === '"') { currentField += '"'; i++; }
+                    else { inQuotes = !inQuotes; }
+                } else if (char === ',' && !inQuotes) {
+                    fields.push(currentField); currentField = '';
+                } else {
+                    currentField += char;
+                }
+            }
+            fields.push(currentField);
+            return fields;
+        };
+
+        // 단일 시트 CSV 파싱 함수
+        function parseSingleSheetCsv(csvText, sheetName) {
+            // console.log(`parseSingleSheetCsv: '${sheetName}' 파싱 시작`); // 로그 필요시 활성화
+            const lines = csvText.trim().split(/\r?\n/);
+            if (lines.length < 2) {
+                 console.warn(`'${sheetName}' 시트 데이터 매우 짧음 (${lines.length}줄). 헤더/데이터 없음.`);
+                 sheetHeaders[sheetName] = [];
+                 sheetData[sheetName] = [];
+                 return true;
+            }
+
+            const currentHeaders = [];
+            const currentAllData = [];
+
+            try {
+                const headerLine = lines[1];
+                const parsedHeaderFields = parseCsvLine(headerLine);
+                if (parsedHeaderFields.length > 11) {
+                    currentHeaders.push(...parsedHeaderFields.slice(3, 12).map(h => h.trim()));
+                } else {
+                     throw new Error(`'${sheetName}' 시트 헤더 열 개수 부족 (${parsedHeaderFields.length}개).`);
+                }
+
+                for (let i = 2; i < lines.length; i++) {
+                    if (lines[i].trim() === '') continue;
+                    const fields = parseCsvLine(lines[i]);
+                    currentAllData.push(fields);
+                }
+                // console.log(`'${sheetName}' 시트 데이터 ${currentAllData.length} 행 처리 완료.`); // 로그 필요시 활성화
+
+                sheetHeaders[sheetName] = currentHeaders;
+                sheetData[sheetName] = currentAllData;
+                return true;
+
+            } catch (error) {
+                 console.error(`parseSingleSheetCsv: '${sheetName}' 파싱 중 오류 발생:`, error);
+                 sheetHeaders[sheetName] = [];
+                 sheetData[sheetName] = [];
+                 throw error;
+            }
+        }
+
+
+        // 여러 시트 데이터 가져오기 및 파싱 함수
+        async function fetchAndParseMultiSheetData(maxRetries = 3, retryDelay = 1500) {
+            sheetData = {};
+            sheetHeaders = {};
+            errorMessage.classList.add('hidden');
+            errorMessage.textContent = '';
+
+            const fetchPromises = [];
+            let requestCount = 0;
+
+            for (const sheetName of TARGET_SHEETS_ORDER) {
+                const gid = SHEET_CONFIG[sheetName];
+                if (gid && typeof gid === 'string' && !gid.startsWith("GID_")) {
+                    requestCount++;
+                    const sheetUrl = `${BASE_URL}?gid=${gid}&single=true&output=csv`;
+                    // console.log(`Fetching sheet: ${sheetName} (URL: ${sheetUrl})`); // 로그 필요시 활성화
+                    fetchPromises.push(
+                        fetch(sheetUrl)
+                            .then(response => {
+                                if (!response.ok) {
+                                    throw new Error(`'${sheetName}' 시트 로딩 실패 (${response.status}): ${response.statusText}`);
+                                }
+                                return response.text();
+                            })
+                            .then(csvText => {
+                                if (!csvText || csvText.trim() === '') {
+                                    console.warn(`'${sheetName}' 시트에서 비어있는 CSV 데이터 수신.`);
+                                    sheetHeaders[sheetName] = [];
+                                    sheetData[sheetName] = [];
+                                    return { success: true, sheetName: sheetName, isEmpty: true };
+                                }
+                                parseSingleSheetCsv(csvText, sheetName);
+                                // console.log(`Successfully parsed sheet: ${sheetName}`); // 로그 필요시 활성화
+                                return { success: true, sheetName: sheetName, isEmpty: false };
+                            })
+                            .catch(error => {
+                                console.error(`'${sheetName}' 시트 처리 중 오류:`, error);
+                                sheetHeaders[sheetName] = [];
+                                sheetData[sheetName] = [];
+                                errorMessage.textContent += `'${sheetName}' 처리 오류: ${error.message}\n`;
+                                errorMessage.classList.remove('hidden');
+                                return { success: false, sheetName: sheetName, error: error };
+                            })
+                    );
+                } else {
+                    console.warn(`'${sheetName}' 시트의 GID가 설정되지 않았습니다. 건너뜁니다.`);
+                }
+            }
+
+            if (fetchPromises.length === 0) {
+                 errorMessage.textContent = '데이터를 가져올 시트가 설정되지 않았습니다. (GID 확인 필요)';
+                 errorMessage.classList.remove('hidden');
+                 return false;
+            }
+
+            const results = await Promise.all(fetchPromises);
+
+            const failedSheets = results.filter(r => !r.success);
+            if (failedSheets.length > 0) {
+                console.error("일부 시트 로딩/파싱 실패:", failedSheets.map(f => f.sheetName));
+            }
+
+            const successfulSheets = results.filter(r => r.success && !r.isEmpty);
+             if (successfulSheets.length === 0 && requestCount > 0) {
+                 console.warn("모든 대상 시트가 비어있거나 로딩/파싱에 실패했습니다.");
+                 if (errorMessage.classList.contains('hidden')) {
+                     errorMessage.textContent = '데이터를 성공적으로 불러온 시트가 없습니다.';
+                     errorMessage.classList.remove('hidden');
+                 }
+                 return false;
+             }
+
+            console.log("모든 시트 처리 완료.");
+            return true;
+        }
+
+
+        // 로딩 상태 표시 함수
+        function showLoading(isLoading, message = '') {
+            if (isLoading) {
+                searchButton.disabled = true;
+                buttonText.classList.add('hidden');
+                loadingSpinner.classList.remove('hidden');
+                loadingText.textContent = message;
+                loadingText.classList.remove('hidden');
+            } else {
+                searchButton.disabled = false;
+                buttonText.classList.remove('hidden');
+                loadingSpinner.classList.add('hidden');
+                loadingText.classList.add('hidden');
+            }
+        }
+
+        // 분석비 문자열을 숫자로 변환하는 함수
+        function parseFee(feeString) {
+            if (!feeString || typeof feeString !== 'string') { return 0; }
+            const cleanedString = feeString.replace(/,/g, '');
+            if (!/^\d+$/.test(cleanedString)) { return 0; }
+            const number = parseInt(cleanedString, 10);
+            return isNaN(number) ? 0 : number;
+        }
+
+        // 숫자를 통화 형식 문자열로 변환하는 함수
+        function formatCurrency(number) {
+            if (typeof number !== 'number' || isNaN(number)) { return '0'; }
+            return number.toLocaleString('ko-KR');
+        }
+
+        // 분석관 검색 및 결과 표시 함수
+        async function searchAnalyst() {
+            const analystName = analystNameInput.value.trim();
+            const analystNameLower = analystName.toLowerCase();
+            // console.log(`--- searchAnalyst: 검색 시작 (대상: '${analystName}') ---`); // 로그 필요시 활성화
+
+            if (!analystName) {
+                errorMessage.textContent = '분석관 이름을 입력해주세요.';
+                errorMessage.classList.remove('hidden');
+                analystNameInput.focus();
+                resultsContainer.innerHTML = '';
+                totalFeeDisplay.classList.add('hidden');
+                noResultsMessageGlobal.classList.add('hidden');
+                return;
+            } else {
+                 if (errorMessage.textContent === '분석관 이름을 입력해주세요.') {
+                    errorMessage.classList.add('hidden');
+                    errorMessage.textContent = '';
+                }
+            }
+
+            showLoading(true, '최신 데이터 로딩 중...');
+            const success = await fetchAndParseMultiSheetData();
+            showLoading(false);
+
+            resultsContainer.innerHTML = '';
+            totalFeeDisplay.classList.add('hidden');
+            noResultsMessageGlobal.classList.add('hidden');
+
+            if (!success) {
+                 if (errorMessage.classList.contains('hidden')) {
+                     noResultsMessageGlobal.textContent = '데이터를 불러오지 못했거나 데이터가 없습니다.';
+                     noResultsMessageGlobal.classList.remove('hidden');
+                 }
+                return;
+            }
+
+            if (Object.keys(sheetData).length === 0 || Object.values(sheetData).every(data => !Array.isArray(data) || data.length === 0)) {
+                 noResultsMessageGlobal.textContent = '데이터가 없습니다. (시트 내용 확인 필요)';
+                 noResultsMessageGlobal.classList.remove('hidden');
+                return;
+            }
+
+            let totalFee = 0;
+            const resultsBySheet = {};
+            let foundMatchesOverall = false;
+
+            // console.log("searchAnalyst: 시트별 데이터 필터링 시작..."); // 로그 필요시 활성화
+            for (const sheetName of TARGET_SHEETS_ORDER) {
+                if (sheetData[sheetName] && Array.isArray(sheetData[sheetName]) && sheetData[sheetName].length > 0) {
+                    const currentSheetRows = sheetData[sheetName];
+                    const matchedRowsForSheet = [];
+                    // console.log(`'${sheetName}' 시트 검색 중 (${currentSheetRows.length} 행)`); // 로그 필요시 활성화
+
+                    currentSheetRows.forEach((row, rowIndex) => {
+                        if (Array.isArray(row) && row.length > 9) {
+                            const analystE = row[4] ? String(row[4]).trim().toLowerCase() : '';
+                            const analystI = row[8] ? String(row[8]).trim().toLowerCase() : '';
+                            let rowMatches = false;
+
+                            if (analystE === analystNameLower) {
+                                totalFee += parseFee(row[5]);
+                                rowMatches = true;
+                            }
+                            if (analystI === analystNameLower) {
+                                totalFee += parseFee(row[9]);
+                                rowMatches = true;
+                            }
+
+                            if (rowMatches) {
+                                const displayData = row.slice(3, 12).map(field =>
+                                    typeof field === 'string' ? field.trim() : field
+                                );
+                                matchedRowsForSheet.push(displayData);
+                                foundMatchesOverall = true;
+                            }
+                        }
+                    });
+
+                    if (matchedRowsForSheet.length > 0) {
+                        resultsBySheet[sheetName] = matchedRowsForSheet;
+                        // console.log(`'${sheetName}' 시트에서 ${matchedRowsForSheet.length}개 행 일치 발견.`); // 로그 필요시 활성화
+                    }
+                } else {
+                     // console.log(`'${sheetName}' 시트 데이터 없음 또는 로드 실패.`); // 로그 필요시 활성화
+                }
+            }
+            // console.log(`searchAnalyst: 필터링 완료. 총 분석비: ${totalFee}, 전체 일치 여부: ${foundMatchesOverall}`); // 로그 필요시 활성화
+
+            resultsContainer.innerHTML = '';
+
+            if (foundMatchesOverall) {
+                totalFeeDisplay.textContent = `"${analystName}" 분석관 총 분석비: ${formatCurrency(totalFee)} 원`;
+                totalFeeDisplay.classList.remove('hidden');
+
+                let resultsHtml = '';
+                for (const sheetName of TARGET_SHEETS_ORDER) {
+                    if (resultsBySheet[sheetName]) {
+                        resultsHtml += `<h3 class="sheet-title">${sheetName}</h3>`;
+                        resultsHtml += `<div class="overflow-x-auto"><table class="min-w-full bg-white rounded-lg shadow mb-6"><thead><tr>`;
+                        const currentHeaders = sheetHeaders[sheetName];
+                        if (Array.isArray(currentHeaders) && currentHeaders.length > 0) {
+                            currentHeaders.forEach(headerText => {
+                                resultsHtml += `<th class="px-4 py-2 border">${headerText != null ? headerText : ''}</th>`;
+                            });
+                        } else {
+                            resultsHtml += `<th colspan="9" class="px-4 py-2 border text-center text-gray-500">표 헤더 정보를 불러올 수 없습니다.</th>`;
+                        }
+                        resultsHtml += `</tr></thead><tbody>`;
+                        resultsBySheet[sheetName].forEach(rowData => {
+                            resultsHtml += '<tr>';
+                            if (Array.isArray(rowData)) {
+                                const expectedLength = currentHeaders ? currentHeaders.length : 9;
+                                for (let i = 0; i < expectedLength; i++) {
+                                    const cellData = rowData[i];
+                                    resultsHtml += `<td class="border px-4 py-2">${cellData != null ? cellData : ''}</td>`;
+                                }
+                            }
+                            resultsHtml += '</tr>';
+                        });
+                        resultsHtml += `</tbody></table></div>`;
+                    }
+                }
+                resultsContainer.innerHTML = resultsHtml;
+                noResultsMessageGlobal.classList.add('hidden');
+
+            } else {
+                noResultsMessageGlobal.textContent = '해당 분석관의 경기 정보를 찾을 수 없습니다.';
+                noResultsMessageGlobal.classList.remove('hidden');
+                totalFeeDisplay.classList.add('hidden');
+            }
+             // console.log("--- searchAnalyst: 검색 종료 ---"); // 로그 필요시 활성화
+        }
+
+        // --- 초기화 및 이벤트 리스너 설정 ---
+        searchButton.addEventListener('click', searchAnalyst);
+        analystNameInput.addEventListener('keypress', function(event) {
+            if (event.key === 'Enter') { searchAnalyst(); }
+        });
+
+        window.onload = () => {
+            console.log("window.onload: 페이지 로드 완료. 초기 데이터 로딩 없음.");
+        };
+
+    </script>
+</body>
+</html>
